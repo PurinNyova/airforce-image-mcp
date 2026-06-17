@@ -36,6 +36,7 @@ except ImportError:
     pass
 
 AIRFORCE_API_KEY = os.environ.get("AIRFORCE_API_KEY", "").strip()
+RESPONSE_FORMAT = os.environ.get("RESPONSE_FORMAT", "b64_json").strip() or "b64_json"
 
 IMAGE_MODELS_URI = "image-models://list"
 IMAGE_MODELS_URL = "https://api.airforce/v1/models"
@@ -149,7 +150,7 @@ async def _generate_image(arguments: dict[str, Any]) -> list[TextContent]:
         "model": arguments["model"],
         "prompt": arguments["prompt"],
         "n": 1,
-        "response_format": "b64_json",
+        "response_format": RESPONSE_FORMAT,
         "sse": False,
     }
     if "aspect_ratio" in arguments:
@@ -169,24 +170,29 @@ async def _generate_image(arguments: dict[str, Any]) -> list[TextContent]:
 
     payload = response.json()
 
-    # Wrap b64 strings as data URLs so callers can use them directly. We
-    # detect the actual image format from the decoded magic bytes — the
-    # upstream may return jpeg, png, webp, gif, or bmp depending on model.
-    for item in payload.get("data", []):
-        b64 = item.get("b64_json") if isinstance(item, dict) else None
-        if not isinstance(b64, str) or not b64:
-            continue
-        try:
-            raw = base64.b64decode(b64, validate=True)
-        except (binascii.Error, ValueError):
-            # Leave undecodable payloads untouched — the caller will see
-            # the raw base64 string and can diagnose upstream issues.
-            log.warning("generate_image: non-base64 payload from upstream, skipping wrap")
-            continue
-        fmt = _detect_image_format(raw)
-        item["b64_json"] = f"data:image/{fmt};base64,{b64}"
+    if RESPONSE_FORMAT == "b64_json":
+        # Wrap b64 strings as data URLs so callers can use them directly. We
+        # detect the actual image format from the decoded magic bytes — the
+        # upstream may return jpeg, png, webp, gif, or bmp depending on model.
+        for item in payload.get("data", []):
+            b64 = item.get("b64_json") if isinstance(item, dict) else None
+            if not isinstance(b64, str) or not b64:
+                continue
+            try:
+                raw = base64.b64decode(b64, validate=True)
+            except (binascii.Error, ValueError):
+                # Leave undecodable payloads untouched — the caller will see
+                # the raw base64 string and can diagnose upstream issues.
+                log.warning("generate_image: non-base64 payload from upstream, skipping wrap")
+                continue
+            fmt = _detect_image_format(raw)
+            item["b64_json"] = f"data:image/{fmt};base64,{b64}"
+    else:
+        # `url` (and any other) format: upstream returns `data[].url` directly;
+        # pass the payload through untouched.
+        log.info("generate_image: response_format=%s, returning payload as-is", RESPONSE_FORMAT)
 
-    return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+    return [TextContent(type="text", text=json.dumps(payload, indent=2))] 
 
 
 # ---------------------------------------------------------------------------

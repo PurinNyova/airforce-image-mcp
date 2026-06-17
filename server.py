@@ -104,7 +104,7 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Generate a single HD image from a text prompt using "
                 "api.airforce. Returns the upstream JSON with a base64-encoded "
-                "image in data[0].b64_json. Use the 'image-models://list' "
+                "image in data[0].b64_json or URL. Use the 'image-models://list' "
                 "resource to discover available model IDs."
             ),
             inputSchema={

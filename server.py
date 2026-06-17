@@ -104,8 +104,9 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Generate a single HD image from a text prompt using "
                 "api.airforce. Returns the upstream JSON with a base64-encoded "
-                "image in data[0].b64_json or URL. Use the 'image-models://list' "
-                "resource to discover available model IDs."
+                "image in data[0].b64_json or URL. Use the 'find_models' tool "
+                "(or the 'image-models://list' resource) to discover available "
+                "model IDs."
             ),
             inputSchema={
                 "type": "object",
@@ -114,7 +115,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": (
                             "Image model ID (e.g. 'flux-2-dev', 'nano-banana-pro'). "
-                            "See the 'image-models://list' resource."
+                            "See the 'find_models' tool."
                         ),
                     },
                     "prompt": {
@@ -129,6 +130,20 @@ async def list_tools() -> list[Tool]:
                 "required": ["model", "prompt"],
             },
         ),
+        Tool(
+            name="find_models",
+            description=(
+                "List image-generation model IDs available on api.airforce. "
+                "Tool-call equivalent of the 'image-models://list' resource, "
+                "provided for clients that don't expose MCP resources. Returns "
+                "a JSON object with a 'models' array and a 'count'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        ),
     ]
 
 
@@ -138,8 +153,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     if name == "generate_image":
         return await _generate_image(arguments)
+    if name == "find_models":
+        return await _find_models()
 
     raise ValueError(f"Unknown tool: {name}")
+
+
+async def _find_models() -> list[TextContent]:
+    """Tool-call equivalent of the ``image-models://list`` resource."""
+    models = await get_image_models()
+    return [TextContent(type="text", text=json.dumps(
+        {"models": models, "count": len(models)}, indent=2
+    ))]
 
 
 async def _generate_image(arguments: dict[str, Any]) -> list[TextContent]:

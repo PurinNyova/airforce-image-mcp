@@ -1,17 +1,18 @@
 [project]
 name = "image-generation-mcp"
 version = "0.1.0"
-description = "MCP stdio server boilerplate."
+description = "MCP stdio for Airforce Image Generation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "You" },
+    { name = "PurinNyova" },
 ]
 keywords = ["mcp", "model-context-protocol", "stdio"]
 dependencies = [
     "mcp>=1.0.0",
     "httpx>=0.27",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.scripts]

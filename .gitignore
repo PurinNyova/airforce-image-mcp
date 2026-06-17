@@ -50,5 +50,9 @@ coverage.xml
 .env.*
 !.env.example
 
+# MD
+*.md
+!README.md
+
 # MCP / stdio logs
 *.log

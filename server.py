@@ -9,6 +9,8 @@ Communicates over stdio using the Model Context Protocol (MCP).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
@@ -29,13 +31,7 @@ from mcp.types import (
     Tool,
 )
 
-# ---------------------------------------------------------------------------
-# Environment / configuration
-# ---------------------------------------------------------------------------
-# Best-effort .env loading so the server picks up AIRFORCE_API_KEY from a
-# local .env file during development. python-dotenv is optional; if it isn't
-# installed we fall back to plain os.environ (env vars set by the parent
-# process / MCP host still work).
+# Best-effort .env loading for local dev.
 try:
     from dotenv import load_dotenv
 
@@ -45,21 +41,14 @@ except ImportError:
 
 AIRFORCE_API_KEY = os.environ.get("AIRFORCE_API_KEY", "").strip()
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 IMAGE_MODELS_URI = "image-models://list"
 IMAGE_MODELS_URL = "https://api.airforce/v1/models"
-IMAGE_MODELS_TTL_SECONDS = 5 * 60  # cache for 5 minutes
+IMAGE_MODELS_TTL = 5 * 60  # seconds
 
 IMAGE_GENERATIONS_URL = "https://api.airforce/v1/images/generations"
-IMAGE_GENERATION_TIMEOUT_SECONDS = 300.0  # upstream renders can be slow
+IMAGE_GENERATION_TIMEOUT = 300.0
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-# IMPORTANT: MCP stdio servers must not write to stdout — that channel is
-# reserved for JSON-RPC frames. Send all logs to stderr.
+# MCP stdio servers must not write to stdout — that's reserved for JSON-RPC.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -67,44 +56,52 @@ logging.basicConfig(
 )
 log = logging.getLogger("mcp-server")
 
-# ---------------------------------------------------------------------------
-# Server instance
-# ---------------------------------------------------------------------------
-app = Server("boilerplate-mcp-server")
+app = Server("image-generation-mcp")
+
+
+def _http_client() -> httpx.AsyncClient:
+    headers = {"Accept": "application/json"}
+    if AIRFORCE_API_KEY:
+        headers["Authorization"] = f"Bearer {AIRFORCE_API_KEY}"
+    return httpx.AsyncClient(headers=headers)
 
 
 # ---------------------------------------------------------------------------
-# Tool listing
+# Image format detection
+# ---------------------------------------------------------------------------
+# Sniffed from the decoded base64 bytes. The upstream may return JPEG, PNG,
+# WebP, GIF, or BMP depending on the model — we MUST match the actual bytes,
+# not hardcode jpeg, or the data URL will misrepresent the payload.
+_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+    (b"RIFF", "webp"),  # disambiguated by 'WEBP' at offset 8 below
+    (b"BM", "bmp"),
+)
+
+
+def _detect_image_format(raw: bytes) -> str:
+    """Return an image MIME subtype for ``raw`` based on its magic bytes.
+
+    Falls back to ``"jpeg"`` when the input is too short or doesn't match
+    any known signature, since api.airforce's most common return is JPEG.
+    """
+    for prefix, fmt in _IMAGE_MAGIC:
+        if raw.startswith(prefix):
+            if fmt == "webp" and (len(raw) < 12 or raw[8:12] != b"WEBP"):
+                continue
+            return fmt
+    return "jpeg"
+
+
+# ---------------------------------------------------------------------------
+# Tools
 # ---------------------------------------------------------------------------
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        Tool(
-            name="echo",
-            description="Return the input text unchanged. Useful as a sanity check.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Text to echo back.",
-                    },
-                },
-                "required": ["text"],
-            },
-        ),
-        Tool(
-            name="add",
-            description="Add two numbers and return the sum.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "a": {"type": "number", "description": "First number."},
-                    "b": {"type": "number", "description": "Second number."},
-                },
-                "required": ["a", "b"],
-            },
-        ),
         Tool(
             name="generate_image",
             description=(
@@ -119,9 +116,8 @@ async def list_tools() -> list[Tool]:
                     "model": {
                         "type": "string",
                         "description": (
-                            "Image model ID. Filter the 'image-models://list' "
-                            "resource by media_type == 'image' to find valid "
-                            "options (e.g. 'flux-2-dev', 'nano-banana-pro')."
+                            "Image model ID (e.g. 'flux-2-dev', 'nano-banana-pro'). "
+                            "See the 'image-models://list' resource."
                         ),
                     },
                     "prompt": {
@@ -130,11 +126,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "aspect_ratio": {
                         "type": "string",
-                        "description": (
-                            "Aspect ratio of the output: '16:9', '1:1', or "
-                            "'9:16'. Validated against the model's "
-                            "image_caps.aspect_ratios."
-                        ),
+                        "description": "Aspect ratio: '16:9', '1:1', or '9:16'.",
                     },
                 },
                 "required": ["model", "prompt"],
@@ -143,114 +135,60 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Tool dispatch
-# ---------------------------------------------------------------------------
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    log.info("Tool call: %s args=%s", name, arguments)
-
-    if name == "echo":
-        text = arguments.get("text", "")
-        if not isinstance(text, str):
-            raise ValueError("'text' must be a string")
-        return [TextContent(type="text", text=text)]
-
-    if name == "add":
-        a = arguments.get("a")
-        b = arguments.get("b")
-        if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
-            raise ValueError("'a' and 'b' must be numbers")
-        return [TextContent(type="text", text=str(a + b))]
+    log.info("Tool call: %s", name)
 
     if name == "generate_image":
-        return await _handle_generate_image(arguments)
+        return await _generate_image(arguments)
 
     raise ValueError(f"Unknown tool: {name}")
 
 
-# ---------------------------------------------------------------------------
-# Image generation
-# ---------------------------------------------------------------------------
-# Fields we forward to the upstream. n, quality, and response_format are
-# hardcoded — callers control them through tool behavior, not arguments.
-_GENERATE_IMAGE_FIXED = {
-    "n": 1,
-    "quality": "hd",
-    "response_format": "b64_json",
-}
-
-
-async def _handle_generate_image(arguments: dict[str, Any]) -> list[TextContent]:
-    """Call POST /v1/images/generations and return the upstream JSON."""
-    if not isinstance(arguments, dict):
-        raise ValueError("arguments must be a JSON object")
-
+async def _generate_image(arguments: dict[str, Any]) -> list[TextContent]:
     if not AIRFORCE_API_KEY:
-        raise ValueError(
-            "AIRFORCE_API_KEY is not configured. Set it in your environment "
-            "or .env file before calling generate_image."
-        )
+        raise ValueError("AIRFORCE_API_KEY is not configured.")
 
-    model = arguments.get("model")
-    prompt = arguments.get("prompt")
-    if not isinstance(model, str) or not model:
-        raise ValueError("'model' is required and must be a non-empty string")
-    if not isinstance(prompt, str) or not prompt:
-        raise ValueError("'prompt' is required and must be a non-empty string")
-
-    body: dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        **_GENERATE_IMAGE_FIXED,
+    body = {
+        "model": arguments["model"],
+        "prompt": arguments["prompt"],
+        "n": 1,
+        "response_format": "b64_json",
+        "sse": False,
     }
+    if "aspect_ratio" in arguments:
+        body["aspect_ratio"] = arguments["aspect_ratio"]
 
-    aspect_ratio = arguments.get("aspect_ratio")
-    if aspect_ratio is not None:
-        if not isinstance(aspect_ratio, str):
-            raise ValueError("'aspect_ratio' must be a string")
-        body["aspect_ratio"] = aspect_ratio
+    log.info("generate_image: model=%s", body["model"])
 
-    log.info(
-        "generate_image: model=%s prompt_len=%d aspect_ratio=%s",
-        model,
-        len(prompt),
-        body.get("aspect_ratio"),
-    )
-
-    async with _build_http_client() as client:
-        try:
-            response = await client.post(
-                IMAGE_GENERATIONS_URL,
-                json=body,
-                timeout=IMAGE_GENERATION_TIMEOUT_SECONDS,
-            )
-        except httpx.HTTPError as exc:
-            log.exception("generate_image: HTTP error talking to upstream")
-            raise ValueError(f"Failed to reach image generation API: {exc}") from exc
+    async with _http_client() as client:
+        response = await client.post(
+            IMAGE_GENERATIONS_URL, json=body, timeout=IMAGE_GENERATION_TIMEOUT
+        )
 
     if response.status_code >= 400:
-        # Pass the upstream error body through verbatim so the model can
-        # diagnose validation/capability issues.
-        detail = response.text
-        try:
-            detail_json = response.json()
-            detail = json.dumps(detail_json)
-        except ValueError:
-            pass
-        log.error(
-            "generate_image: upstream %s: %s", response.status_code, detail
-        )
         raise ValueError(
-            f"Image generation API returned HTTP {response.status_code}: {detail}"
+            f"Image generation API returned HTTP {response.status_code}: {response.text}"
         )
 
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise ValueError(
-            "Image generation API returned a non-JSON response."
-        ) from exc
+    payload = response.json()
+
+    # Wrap b64 strings as data URLs so callers can use them directly. We
+    # detect the actual image format from the decoded magic bytes — the
+    # upstream may return jpeg, png, webp, gif, or bmp depending on model.
+    for item in payload.get("data", []):
+        b64 = item.get("b64_json") if isinstance(item, dict) else None
+        if not isinstance(b64, str) or not b64:
+            continue
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            # Leave undecodable payloads untouched — the caller will see
+            # the raw base64 string and can diagnose upstream issues.
+            log.warning("generate_image: non-base64 payload from upstream, skipping wrap")
+            continue
+        fmt = _detect_image_format(raw)
+        item["b64_json"] = f"data:image/{fmt};base64,{b64}"
 
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
@@ -258,64 +196,30 @@ async def _handle_generate_image(arguments: dict[str, Any]) -> list[TextContent]
 # ---------------------------------------------------------------------------
 # Resources
 # ---------------------------------------------------------------------------
-_image_models_cache: list[str] | None = None
-_image_models_cache_at: float = 0.0
-_image_models_lock = asyncio.Lock()
+# Simple TTL cache. asyncio is single-threaded; a duplicate fetch on cold
+# start is harmless, so no lock needed.
+_models_cache: tuple[float, list[str]] | None = None
 
 
-async def _fetch_image_models(client: httpx.AsyncClient) -> list[str]:
-    """Fetch the list of image model IDs from the airforce API."""
-    response = await client.get(IMAGE_MODELS_URL, timeout=30.0)
-    response.raise_for_status()
-    payload = response.json()
-    return [
-        model["id"]
-        for model in payload.get("data", [])
-        if isinstance(model, dict) and model.get("media_type") == "image"
+async def get_image_models() -> list[str]:
+    global _models_cache
+
+    if _models_cache and (time.monotonic() - _models_cache[0]) < IMAGE_MODELS_TTL:
+        return _models_cache[1]
+
+    log.info("Fetching image model list")
+    async with _http_client() as client:
+        response = await client.get(IMAGE_MODELS_URL, timeout=30.0)
+        response.raise_for_status()
+        payload = response.json()
+
+    models = [
+        m["id"]
+        for m in payload.get("data", [])
+        if isinstance(m, dict) and m.get("media_type") == "image"
     ]
-
-
-def _build_http_client() -> httpx.AsyncClient:
-    """Build an httpx client, attaching the AirForce API key if configured."""
-    headers: dict[str, str] = {"Accept": "application/json"}
-    if AIRFORCE_API_KEY:
-        headers["Authorization"] = f"Bearer {AIRFORCE_API_KEY}"
-    else:
-        log.warning(
-            "AIRFORCE_API_KEY is not set; authenticated endpoints will fail. "
-            "Set it in your environment or .env file (see .env.example)."
-        )
-    return httpx.AsyncClient(headers=headers)
-
-
-async def get_image_models(force_refresh: bool = False) -> list[str]:
-    """Return cached image model IDs, refreshing when stale."""
-    global _image_models_cache, _image_models_cache_at
-
-    now = time.monotonic()
-    if (
-        not force_refresh
-        and _image_models_cache is not None
-        and (now - _image_models_cache_at) < IMAGE_MODELS_TTL_SECONDS
-    ):
-        return _image_models_cache
-
-    async with _image_models_lock:
-        # Re-check inside the lock to avoid duplicate refreshes.
-        now = time.monotonic()
-        if (
-            not force_refresh
-            and _image_models_cache is not None
-            and (now - _image_models_cache_at) < IMAGE_MODELS_TTL_SECONDS
-        ):
-            return _image_models_cache
-
-        log.info("Fetching image model list from %s", IMAGE_MODELS_URL)
-        async with _build_http_client() as client:
-            _image_models_cache = await _fetch_image_models(client)
-            _image_models_cache_at = time.monotonic()
-        log.info("Cached %d image models", len(_image_models_cache))
-        return _image_models_cache
+    _models_cache = (time.monotonic(), models)
+    return models
 
 
 @app.list_resources()
@@ -324,10 +228,7 @@ async def list_resources() -> list[Resource]:
         Resource(
             uri=IMAGE_MODELS_URI,
             name="Image Models",
-            description=(
-                "List of image-generation model IDs available on "
-                "api.airforce (filtered to media_type == 'image')."
-            ),
+            description="List of image-generation model IDs available on api.airforce.",
             mimeType="application/json",
         ),
     ]
@@ -352,9 +253,7 @@ async def list_prompts() -> list[Prompt]:
             description="Ask the model to summarize a piece of text.",
             arguments=[
                 PromptArgument(
-                    name="text",
-                    description="Text to summarize.",
-                    required=True,
+                    name="text", description="Text to summarize.", required=True
                 ),
             ],
         ),
@@ -363,9 +262,8 @@ async def list_prompts() -> list[Prompt]:
 
 @app.get_prompt()
 async def get_prompt(name: str, arguments: dict[str, Any] | None) -> GetPromptResult:
-    arguments = arguments or {}
     if name == "summarize":
-        text = arguments.get("text", "")
+        text = (arguments or {}).get("text", "")
         return GetPromptResult(
             description="Summarize the provided text.",
             messages=[
@@ -387,11 +285,7 @@ async def get_prompt(name: str, arguments: dict[str, Any] | None) -> GetPromptRe
 async def main() -> None:
     log.info("Starting MCP stdio server 'boilerplate-mcp-server'")
     async with stdio_server() as (read_stream, write_stream):
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options(),
-        )
+        await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
 if __name__ == "__main__":

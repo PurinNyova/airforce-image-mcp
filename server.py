@@ -1,4 +1,4 @@
-"""Stdio MCP server boilerplate.
+"""Stdio MCP Image Generation Server.
 
 Run with:
     python server.py
@@ -22,10 +22,6 @@ import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
-    GetPromptResult,
-    Prompt,
-    PromptArgument,
-    PromptMessage,
     Resource,
     TextContent,
     Tool,
@@ -243,47 +239,10 @@ async def read_resource(uri: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
-@app.list_prompts()
-async def list_prompts() -> list[Prompt]:
-    return [
-        Prompt(
-            name="summarize",
-            description="Ask the model to summarize a piece of text.",
-            arguments=[
-                PromptArgument(
-                    name="text", description="Text to summarize.", required=True
-                ),
-            ],
-        ),
-    ]
-
-
-@app.get_prompt()
-async def get_prompt(name: str, arguments: dict[str, Any] | None) -> GetPromptResult:
-    if name == "summarize":
-        text = (arguments or {}).get("text", "")
-        return GetPromptResult(
-            description="Summarize the provided text.",
-            messages=[
-                PromptMessage(
-                    role="user",
-                    content=TextContent(
-                        type="text",
-                        text=f"Please summarize the following text:\n\n{text}",
-                    ),
-                ),
-            ],
-        )
-    raise ValueError(f"Unknown prompt: {name}")
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 async def main() -> None:
-    log.info("Starting MCP stdio server 'boilerplate-mcp-server'")
+    log.info("Starting MCP stdio server 'image-generation-mcp-server'")
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 

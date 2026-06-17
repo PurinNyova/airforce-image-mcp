@@ -24,6 +24,25 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
+include = [
+    "server.py",
+    "README.md",
+    "LICENSE",
+]
+exclude = [
+    ".env",
+    ".env.*",
+    ".gitignore",
+    ".git",
+    ".mcp.json",
+    ".python-version",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "test_scripts",
+    "test_scripts/*",
+    "test_scripts/.*",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

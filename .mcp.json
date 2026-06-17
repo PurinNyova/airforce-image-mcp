@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "image-generation": {
+      "command": "uvx",
+      "args": ["image-generation-mcp"],
+      "env": { "AIRFORCE_API_KEY": "${env:AIRFORCE_API_KEY}" }
+    }
+  }
+}
